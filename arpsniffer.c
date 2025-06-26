@@ -59,7 +59,7 @@ void log_event(const char* message) {
 
 void block_ip(const char* ip) {
     char cmd[100];
-    sprintf(cmd, "sudo iptables -A INPUT -s %s -j DROP", ip);
+    sprintf(cmd, "sudo iptables -I INPUT -s %s -j DROP", ip);
     system(cmd);
     
     char log_msg[256];
@@ -153,64 +153,70 @@ char *get_ip_address(uint8_t ip[4]) {
 }
 
 void process_arp_packet(arp_hdr *arpheader) {
-    char *s_mac = get_hardware_address(arpheader->sender_mac);
-    char *s_ip = get_ip_address(arpheader->sender_ip);
-    time_t now = time(NULL);
-    int found = 0;
+        char *s_mac = get_hardware_address(arpheader->sender_mac);
+        char *s_ip = get_ip_address(arpheader->sender_ip);
+        time_t now = time(NULL);
+        int found = 0;
 
-    printf("\n----------------------------------------------------------------\n");
-    printf("Operation Type: %s\n", (ntohs(arpheader->opcode) == ARP_REQUEST) ? "ARP Request" : "ARP Response");
-    printf("Sender MAC: %s\n", s_mac);
-    printf("Sender IP: %s\n", s_ip);
-    printf("Target MAC: %s\n", get_hardware_address(arpheader->target_mac));
-    printf("Target IP: %s\n", get_ip_address(arpheader->target_ip));
-    printf("-----------------------------------------------------------------\n");
+        
 
-    // Check if we already have this IP in our records
-    for (int i = 0; i < record_count; i++) {
-        if (strcmp(records[i].ip, s_ip) == 0) {
-            found = 1;
-            // Update MAC if it's different (possible spoofing)
-            if (strcmp(records[i].mac, s_mac) != 0) {
-                char log_msg[256];
-                snprintf(log_msg, sizeof(log_msg), 
-                    "MAC address changed for IP %s (was %s, now %s) - possible spoofing", 
-                    s_ip, records[i].mac, s_mac);
-                log_event(log_msg);
-                strcpy(records[i].mac, s_mac);
+        // Check if we already have this IP in our records
+        for (int i = 0; i < record_count; i++) {
+            if (strcmp(records[i].ip, s_ip) == 0) {
+                found = 1;
+                // skip blocked ips
+                if (records[i].blocked) {
+                    break;
+                }
+                printf("\n----------------------------------------------------------------\n");
+                printf("Operation Type: %s\n", (ntohs(arpheader->opcode) == ARP_REQUEST) ? "ARP Request" : "ARP Response");
+                printf("Sender MAC: %s\n", s_mac);
+                printf("Sender IP: %s\n", s_ip);
+                printf("Target MAC: %s\n", get_hardware_address(arpheader->target_mac));
+                printf("Target IP: %s\n", get_ip_address(arpheader->target_ip));
+                printf("-----------------------------------------------------------------\n");
+                // Update MAC if it's different (possible spoofing)
+                // Only count ARP responses
+                if (ntohs(arpheader->opcode) == ARP_RESPONSE) {
+                    if (strcmp(records[i].mac, s_mac) != 0) {
+                        char log_msg[256];
+                        snprintf(log_msg, sizeof(log_msg), 
+                            "MAC address changed for IP %s (was %s, now %s) - possible spoofing", 
+                            s_ip, records[i].mac, s_mac);
+                        log_event(log_msg);
+                        strcpy(records[i].mac, s_mac);
+                    }
+
+                    if (difftime(now, records[i].first_seen) <= TIME_WINDOW) {
+                        records[i].count++;
+                    } else {
+                        records[i].count = 1;
+                        records[i].first_seen = now;
+                    }
+
+                    if (records[i].count >= THRESHOLD&& !records[i].blocked) {
+                        alert_spoof(s_ip, s_mac);
+                        block_ip(s_ip);
+                        send_alert(s_ip, s_mac);
+                        records[i].blocked = 1;
+                    }
+                }
+                break;
             }
-
-            if (difftime(now, records[i].first_seen) <= TIME_WINDOW) {
-                records[i].count++;
-            } else {
-                // Reset counter if outside time window
-                records[i].count = 1;
-                records[i].first_seen = now;
-            }
-
-            if (records[i].count >= THRESHOLD && records[i].blocked == 0) {
-                alert_spoof(s_ip, s_mac);
-                block_ip(s_ip);
-                send_alert(s_ip, s_mac);
-                records[i].blocked = 1;
-            }
-            break;
         }
-    }
 
-    if (!found) {
-        if (record_count < MAX_IPS) {
-            strcpy(records[record_count].ip, s_ip);
-            strcpy(records[record_count].mac, s_mac);
-            records[record_count].count = 1;
-            records[record_count].first_seen = now;
-            records[record_count].blocked = 0;
-            record_count++;
+        if (!found&& record_count < MAX_IPS) {
+                strcpy(records[record_count].ip, s_ip);
+                strcpy(records[record_count].mac, s_mac);
+                records[record_count].count = (ntohs(arpheader->opcode) == ARP_RESPONSE) ? 1 : 0;
+                records[record_count].first_seen = now;
+                records[record_count].blocked = 0;
+                record_count++;
         }
-    }
 
-    free(s_mac);
-    free(s_ip);
+        free(s_mac);
+        free(s_ip);
+        
 }
 
 int sniff_arp(char *device_name) {
